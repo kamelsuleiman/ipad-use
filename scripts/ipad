@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""ipad — let an AI agent see and drive a real iPad over Wi-Fi (WebDriverAgent). Python 3.9+, stdlib only.
+
+Core loop:   ipad see            → screenshot + NUMBERED on-screen elements
+             ipad tap 7          → tap element #7 from the last `see`
+             ipad run "tap 7; type 'hello'; wait 1; see"   → several steps in ONE call
+Setup:       scripts/setup.sh  then  ipad doctor
+Docs:        SKILL.md · references/*.md        MIT · https://github.com/kamelsuleiman/ipad-use
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HOME = Path(os.environ.get("IPAD_USE_HOME", Path.home() / ".ipad-use"))
+CONFIG = HOME / "config.json"
+LAST = HOME / "last_see.json"
+SESSION = HOME / "session.json"
+AUDIT = HOME / "audit.jsonl"
+SHOTS = HOME / "shots"
+WDA_LOG = HOME / "wda.log"
+
+# ---- safety gate: never done without the user's explicit OK (the agent must ASK, then re-run with --confirm) ----
+RISKY = re.compile(
+    r"\b(send|post|publish|share|delete|remove|erase|pay|buy|purchase|order|checkout|subscribe|confirm|transfer|"
+    r"sign out|log ?out|reset|install|accept|allow all)\b|إرسال|ارسال|أرسل|ابعث|نشر|انشر|حذف|احذف|امسح|دفع|ادفع|شراء|"
+    r"اشتر|تأكيد|أكد|تحويل|שלח|מחק|תשלום|קנה|פרסם", re.I)
+MESSAGING = {"net.whatsapp.WhatsApp", "net.whatsapp.WhatsAppSMB", "com.apple.MobileSMS", "com.apple.mobilemail",
+             "com.google.Gmail", "com.microsoft.Office.Outlook", "com.burbn.instagram", "ph.telegra.Telegraph",
+             "com.facebook.Facebook", "com.facebook.Messenger", "com.atebits.Tweetie2", "com.zhiliaoapp.musically",
+             "com.linkedin.LinkedIn", "com.tinyspeck.chatlyio", "com.hammerandchisel.discord"}
+
+APPS = {
+    "settings": "com.apple.Preferences", "safari": "com.apple.mobilesafari", "notes": "com.apple.mobilenotes",
+    "reminders": "com.apple.reminders", "calendar": "com.apple.mobilecal", "photos": "com.apple.mobileslideshow",
+    "camera": "com.apple.camera", "files": "com.apple.DocumentsApp", "shortcuts": "com.apple.shortcuts",
+    "mail": "com.apple.mobilemail", "messages": "com.apple.MobileSMS", "music": "com.apple.Music", "maps": "com.apple.Maps",
+    "freeform": "com.apple.freeform", "preview": "com.apple.Preview", "app store": "com.apple.AppStore",
+    "clock": "com.apple.mobiletimer", "calculator": "com.apple.calculator", "weather": "com.apple.weather",
+    "facetime": "com.apple.facetime", "contacts": "com.apple.MobileAddressBook", "books": "com.apple.iBooks",
+    "podcasts": "com.apple.podcasts", "tv": "com.apple.tv", "translate": "com.apple.Translate", "journal": "com.apple.journal",
+    "chrome": "com.google.chrome.ios", "gemini": "com.google.gemini", "chatgpt": "com.openai.chat",
+    "claude": "com.anthropic.claudeforios", "youtube": "com.google.ios.youtube", "instagram": "com.burbn.instagram",
+    "whatsapp": "net.whatsapp.WhatsApp", "procreate": "com.savage.procreate", "google earth": "com.google.b612",
+    # Arabic aliases
+    "الإعدادات": "com.apple.Preferences", "سفاري": "com.apple.mobilesafari", "ملاحظات": "com.apple.mobilenotes",
+    "الملاحظات": "com.apple.mobilenotes", "تذكيرات": "com.apple.reminders", "التقويم": "com.apple.mobilecal",
+    "الصور": "com.apple.mobileslideshow", "الكاميرا": "com.apple.camera", "الملفات": "com.apple.DocumentsApp",
+    "اختصارات": "com.apple.shortcuts", "الخرائط": "com.apple.Maps",
+}
+PRIORITY = {"Button": 0, "TextField": 0, "SecureTextField": 0, "SearchField": 0, "TextView": 0, "Switch": 0, "Slider": 0,
+            "Cell": 1, "Link": 1, "Icon": 1, "Tab": 1, "MenuItem": 1, "SegmentedControl": 1, "Key": 3}
+
+
+# =============================== plumbing ===============================
+def cfg() -> dict:
+    try:
+        return json.loads(CONFIG.read_text())
+    except Exception:
+        return {}
+
+
+def wda_url() -> str:
+    if os.environ.get("IPAD_WDA_URL"):
+        return os.environ["IPAD_WDA_URL"].rstrip("/")
+    try:  # the newest URL WDA announced (its IP can change with DHCP)
+        hits = re.findall(r"ServerURLHere->(http://[^<]+)<-", WDA_LOG.read_text(errors="ignore")[-300000:])
+        if hits:
+            return hits[-1].rstrip("/")
+    except FileNotFoundError:
+        pass
+    if cfg().get("wda_url"):
+        return cfg()["wda_url"].rstrip("/")
+    die("WDA URL unknown. Run scripts/setup.sh, or set IPAD_WDA_URL=http://<ipad-ip>:8100", 2)
+
+
+def http(method: str, path: str, body=None, timeout: float = 30):
+    req = urllib.request.Request(wda_url() + path, method=method, data=None if body is None else json.dumps(body).encode())
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read() or b"{}")
+        except Exception:
+            return {"value": {"error": f"HTTP {e.code}"}}
+
+
+def err(r) -> str | None:
+    v = r.get("value") if isinstance(r, dict) else None
+    return v.get("error") if isinstance(v, dict) else None
+
+
+def session() -> str:
+    if SESSION.exists():
+        sid = json.loads(SESSION.read_text()).get("id")
+        if sid and not err(http("GET", f"/session/{sid}", timeout=10)):
+            return sid
+    r = http("POST", "/session", {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False}}}, timeout=60)
+    sid = r.get("sessionId") or (r.get("value") or {}).get("sessionId")
+    if not sid:
+        die(f"could not open a WDA session: {r}")
+    HOME.mkdir(parents=True, exist_ok=True)
+    SESSION.write_text(json.dumps({"id": sid}))
+    return sid
+
+
+def s(method, path, body=None, timeout=30):
+    return http(method, f"/session/{session()}{path}", body, timeout)
+
+
+def audit(action: str, **kw):
+    HOME.mkdir(parents=True, exist_ok=True)
+    with AUDIT.open("a") as f:
+        f.write(json.dumps({"t": time.strftime("%F %T"), "action": action, **kw}, ensure_ascii=False) + "\n")
+
+
+class Stop(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
+def die(msg, code=1):
+    raise Stop(msg, code)
+
+
+def say(obj):
+    print(obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False, indent=1))
+
+
+def active_app() -> str | None:
+    return (http("GET", "/wda/activeAppInfo", timeout=8).get("value") or {}).get("bundleId")
+
+
+def guard(label: str, confirm: bool, *, enter: bool = False):
+    """Refuse risky actions unless the USER approved (--confirm). Exit code 3 = needs approval."""
+    if confirm:
+        return
+    if label and RISKY.search(label):
+        die(f"NEEDS_APPROVAL: «{label}» looks like send/post/pay/delete. Ask the user; if they agree, re-run the SAME "
+            f"command with --confirm.", 3)
+    if enter and active_app() in MESSAGING:
+        die("NEEDS_APPROVAL: Enter in a messaging/social app sends to people. Ask the user; if they agree, re-run with --confirm.", 3)
+
+
+# =============================== seeing ===============================
+def elements() -> list[dict]:
+    src = s("GET", "/source?format=json&excluded_attributes=", timeout=60).get("value") or {}
+    out = []
+
+    def walk(n):
+        if not isinstance(n, dict):
+            return
+        label = (n.get("label") or n.get("name") or n.get("value") or "").strip()
+        r = n.get("rect") or {}
+        t = (n.get("type") or "").replace("XCUIElementType", "")
+        if re.search(r"UUID=|isActive=|AXID|^[a-z]+[A-Z][A-Za-z]+(View|ID|Id)$", label):   # internal ids → short tag
+            label = "#" + re.sub(r"[?&].*", "", label)[:28]
+        if label and n.get("isVisible", True) not in (False, "0") and r.get("width", 0) > 0 and t not in ("Application", "Window"):
+            out.append({"type": t, "label": " ".join(label.split())[:70], "x": round(r["x"] + r["width"] / 2),
+                        "y": round(r["y"] + r["height"] / 2), "w": round(r["width"]), "h": round(r["height"])})
+        for c in n.get("children") or []:
+            walk(c)
+    walk(src)
+    seen, uniq = set(), []          # drop exact duplicates (label + position)
+    for e in out:
+        k = (e["label"], e["x"] // 6, e["y"] // 6)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(e)
+    uniq.sort(key=lambda e: (PRIORITY.get(e["type"], 2), e["y"], e["x"]))
+    return uniq
+
+
+def screenshot(path: Path | None = None, width: int = 1100) -> Path:
+    SHOTS.mkdir(parents=True, exist_ok=True)
+    r = http("GET", "/screenshot", timeout=40)
+    if not isinstance(r.get("value"), str):
+        die(f"screenshot failed: {r}")
+    png = SHOTS / "_raw.png"
+    png.write_bytes(base64.b64decode(r["value"]))
+    path = path or SHOTS / time.strftime("ipad-%Y%m%d-%H%M%S.jpg")
+    if sys.platform == "darwin":
+        subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "70", "-Z", str(width), str(png), "--out", str(path)],
+                       capture_output=True)
+    if not path.exists():
+        path = png
+    return path
+
+
+def see(shot=True, limit=80, find=None, as_json=False) -> str:
+    els = elements()
+    if find:
+        els = [e for e in els if find.lower() in e["label"].lower()]
+    els = els[:limit]
+    HOME.mkdir(parents=True, exist_ok=True)
+    LAST.write_text(json.dumps({"t": time.time(), "elements": els}, ensure_ascii=False))
+    app = active_app()
+    path = screenshot() if shot else None
+    if as_json:
+        return json.dumps({"app": app, "screenshot": str(path) if path else None, "elements": els}, ensure_ascii=False)
+    head = f"app: {app} · screen 1376×1032 pt (landscape) · {len(els)} elements" + (f" · screenshot: {path}" if path else "")
+    rows = [f"[{i}] {e['type']} «{e['label']}» ({e['x']},{e['y']})" for i, e in enumerate(els)]
+    return "\n".join([head, *rows]) + "\n(tap N uses these numbers; they expire after the screen changes — run `see` again)"
+
+
+def last(n: int) -> dict:
+    try:
+        els = json.loads(LAST.read_text())["elements"]
+        return els[n]
+    except (FileNotFoundError, IndexError, KeyError):
+        die(f"no element #{n} — run `ipad see` first")
+
+
+# =============================== acting ===============================
+def tap(target: list[str], why: str = "", confirm=False) -> str:
+    if len(target) == 1 and target[0].isdigit():
+        e = last(int(target[0]))
+        x, y, label = e["x"], e["y"], e["label"]
+    elif len(target) == 2:
+        x, y, label = float(target[0]), float(target[1]), why
+    else:
+        die("tap N   or   tap X Y --why '<what it is>'")
+    guard(label or why, confirm)
+    r = s("POST", "/wda/tap", {"x": x, "y": y})
+    if err(r):
+        r = s("POST", "/wda/tap/0", {"x": x, "y": y})
+    audit("tap", x=x, y=y, label=label, confirmed=confirm)
+    return f"tapped «{label}» at ({x},{y})" if not err(r) else f"tap failed: {err(r)}"
+
+
+def type_text(text: str, enter=False, why="", confirm=False) -> str:
+    guard(why, confirm, enter=enter)
+    r = s("POST", "/wda/keys", {"value": list(text + ("\n" if enter else ""))}, timeout=60)
+    audit("type", chars=len(text), enter=enter, confirmed=confirm)
+    return f"typed {len(text)} chars{' + Enter' if enter else ''}" if not err(r) else f"type failed: {err(r)}"
+
+
+def swipe(args: list[str]) -> str:
+    w, h = 1376, 1032
+    if len(args) == 1:
+        d = args[0]
+        p = {"up": (w / 2, h * .75, w / 2, h * .25), "down": (w / 2, h * .25, w / 2, h * .75),
+             "left": (w * .8, h / 2, w * .2, h / 2), "right": (w * .2, h / 2, w * .8, h / 2)}.get(d)
+        if not p:
+            die("swipe up|down|left|right   or   swipe X1 Y1 X2 Y2")
+    else:
+        p = tuple(float(v) for v in args[:4])
+    s("POST", "/wda/dragfromtoforduration", {"fromX": p[0], "fromY": p[1], "toX": p[2], "toY": p[3], "duration": 0.15})
+    return f"swiped {' '.join(args)}"
+
+
+def open_app(name: str) -> str:
+    bid = APPS.get(name.lower().strip(), name)
+    r = s("POST", "/wda/apps/activate", {"bundleId": bid}, timeout=60)   # brings a running app forward
+    if err(r):
+        r = s("POST", "/wda/apps/launch", {"bundleId": bid}, timeout=60)
+    audit("open", app=bid)
+    return f"opened {bid}" if not err(r) else f"open failed ({bid}): {err(r)} — try `ipad apps` for the exact bundle id"
+
+
+def open_url(url: str, confirm=False) -> str:
+    if not re.match(r"^(https?|shortcuts|x-safari-https|maps|tel|sms|mailto|[a-z0-9+.-]+)://", url):
+        die("url must include a scheme, e.g. https://…")
+    if url.startswith(("tel:", "sms:", "mailto:")):
+        guard("send " + url, confirm)
+    r = s("POST", "/url", {"url": url}, timeout=60)
+    audit("url", url=url[:200])
+    return f"opened {url}" if not err(r) else f"url failed: {err(r)}"
+
+
+def shortcut(name: str, text: str | None, confirm=False) -> str:
+    q = {"name": name}
+    if text is not None:
+        q.update(input="text", text=text)
+    out = open_url("shortcuts://run-shortcut?" + urllib.parse.urlencode(q, quote_via=urllib.parse.quote), confirm)
+    time.sleep(1.2)
+    al = http("GET", "/alert/text", timeout=5).get("value")
+    return out + (f" · alert: {al}" if isinstance(al, str) else "")
+
+
+def button(name: str) -> str:
+    path = {"home": "/wda/homescreen", "lock": "/wda/lock", "unlock": "/wda/unlock"}.get(name)
+    r = http("POST", path) if path else s("POST", "/wda/pressButton", {"name": name})
+    return f"pressed {name}" if not err(r) else f"{name} failed: {err(r)}"
+
+
+def alert(action: str, btn: str | None = None, confirm=False) -> str:
+    if action == "text":
+        v = http("GET", "/alert/text").get("value")
+        return v if isinstance(v, str) else "(no alert)"
+    if action == "buttons":
+        return json.dumps(s("GET", "/wda/alert/buttons").get("value"), ensure_ascii=False)
+    if btn:
+        guard(btn, confirm)
+    r = s("POST", f"/alert/{action}", {"name": btn} if btn else {})
+    return f"alert {action}" if not err(r) else f"alert {action} failed: {err(r)}"
+
+
+# =============================== batch ===============================
+def run_batch(script: str) -> str:
+    """Several steps in one call: 'tap 3; type "hi"; wait 1; see'. Stops at the first error or approval need."""
+    log = []
+    for raw in [c.strip() for c in re.split(r";\s*(?=(?:[^\"']|\"[^\"]*\"|'[^']*')*$)", script) if c.strip()]:
+        try:
+            argv = shlex.split(raw)
+            log.append(f"$ {raw}\n{dispatch(argv)}")
+        except Stop as e:
+            log.append(f"$ {raw}\nSTOPPED: {e}")
+            break
+    return "\n".join(log)
+
+
+# =============================== agent (optional) ===============================
+AGENT_SYSTEM = """You operate a real iPad (landscape, 1376×1032 points). Each turn you get the goal, a screenshot and a
+numbered element list. Reply JSON only: {"thought":"<≤20 words>","action":{...}} with ONE action:
+{"type":"tap","n":N} | {"type":"tap","x":X,"y":Y,"what":"label"} | {"type":"type","text":"…","enter":false} |
+{"type":"swipe","dir":"up|down|left|right"} | {"type":"open","app":"<name or bundle id>"} | {"type":"url","url":"https://…"} |
+{"type":"home"} | {"type":"wait","sec":1-8} | {"type":"done","success":true,"summary":"…"}.
+Act without asking for confirmation on normal steps; choose sensible defaults. Prefer tap by n. Verify each step on the
+next screenshot. Never type passwords/codes/card numbers. If login or payment blocks you → done success:false."""
+
+
+def agent(goal: str, steps: int = 25) -> str:
+    """Optional fast sub-agent (needs GEMINI_API_KEY). Risky steps stop the run with NEEDS_APPROVAL."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        die("`ipad do` needs GEMINI_API_KEY (or drive the loop yourself with see/tap/run).", 2)
+    model = os.environ.get("IPAD_USE_MODEL", "gemini-3.8-flash")
+    hist, t0 = [], time.time()
+    for i in range(1, steps + 1):
+        els = elements()[:90]
+        LAST.write_text(json.dumps({"t": time.time(), "elements": els}, ensure_ascii=False))
+        jpg = screenshot(width=1000).read_bytes()
+        lst = "\n".join(f"[{k}] {e['type']} «{e['label']}» ({e['x']},{e['y']})" for k, e in enumerate(els))
+        body = {"systemInstruction": {"parts": [{"text": AGENT_SYSTEM}]},
+                "contents": [{"role": "user", "parts": [
+                    {"text": f"GOAL: {goal}\nAPP: {active_app()}\nDONE SO FAR:\n" + ("\n".join(hist[-8:]) or "-") + f"\nELEMENTS:\n{lst}"},
+                    {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(jpg).decode()}}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
+        req = urllib.request.Request(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+                                     data=json.dumps(body).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            d = json.loads(json.loads(r.read())["candidates"][0]["content"]["parts"][0]["text"].strip("`").removeprefix("json"))
+        a = d.get("action") or {}
+        if a.get("type") == "done":
+            return json.dumps({"status": "done" if a.get("success", True) else "failed", "summary": a.get("summary"),
+                               "steps": i - 1, "seconds": round(time.time() - t0, 1), "log": hist[-6:]}, ensure_ascii=False, indent=1)
+        t = a.get("type")
+        try:
+            if t == "tap":
+                res = tap([str(a["n"])]) if a.get("n") is not None else tap([str(a.get("x")), str(a.get("y"))], why=str(a.get("what") or ""))
+            elif t == "type":
+                res = type_text(str(a.get("text") or ""), enter=bool(a.get("enter")))
+            elif t == "swipe":
+                res = swipe([str(a.get("dir") or "up")])
+            elif t == "open":
+                res = open_app(str(a.get("app") or ""))
+            elif t == "url":
+                res = open_url(str(a.get("url") or ""))
+            elif t == "home":
+                res = button("home")
+            elif t == "wait":
+                time.sleep(min(8, max(1, float(a.get("sec") or 2))))
+                res = "waited"
+            else:
+                res = f"unknown action {t}"
+        except Stop as e:
+            return json.dumps({"status": "needs_approval" if e.code == 3 else "error", "message": str(e), "steps": i,
+                               "seconds": round(time.time() - t0, 1), "log": hist[-6:]}, ensure_ascii=False, indent=1)
+        hist.append(f"{i}. {res} ({d.get('thought', '')})")
+        time.sleep(0.4)
+    return json.dumps({"status": "max_steps", "steps": steps, "log": hist[-6:]}, ensure_ascii=False, indent=1)
+
+
+# =============================== doctor / status ===============================
+def doctor() -> str:
+    lines = []
+    ok = lambda b: "✅" if b else "❌"
+    xc = subprocess.run(["xcodebuild", "-version"], capture_output=True, text=True) if sys.platform == "darwin" else None
+    lines.append(f"{ok(xc and xc.returncode == 0)} Xcode: {(xc.stdout.splitlines() or ['missing'])[0] if xc else 'macOS only'}")
+    c = cfg()
+    lines.append(f"{ok(bool(c.get('udid')))} config: {CONFIG if c else 'missing → run scripts/setup.sh'}")
+    try:
+        st = http("GET", "/status", timeout=6).get("value") or {}
+        lines.append(f"{ok(st.get('ready'))} WebDriverAgent at {wda_url()} · iPadOS {(st.get('os') or {}).get('version')}")
+        lk = http("GET", "/wda/locked", timeout=6).get("value")
+        lines.append(f"{ok(lk is False)} screen unlocked" + ("" if lk is False else " → unlock the iPad (Auto-Lock: Never while charging helps)"))
+    except Stop as e:
+        lines.append(f"❌ {e}")
+    except Exception as e:
+        lines.append(f"❌ WebDriverAgent not reachable ({type(e).__name__}) → iPad asleep/locked, or the runner stopped: "
+                     f"launchctl kickstart -k gui/$(id -u)/com.ipad-use.wda")
+    return "\n".join(lines)
+
+
+def status() -> str:
+    st = http("GET", "/status", timeout=8).get("value") or {}
+    b = s("GET", "/wda/batteryInfo", timeout=8).get("value") or {}
+    return json.dumps({"ready": st.get("ready"), "ios": (st.get("os") or {}).get("version"), "app": active_app(),
+                       "locked": http("GET", "/wda/locked", timeout=8).get("value"),
+                       "battery": round(float(b.get("level", 0)) * 100)}, ensure_ascii=False)
+
+
+def apps() -> str:
+    udid = cfg().get("core_id") or cfg().get("udid")
+    p = subprocess.run(["xcrun", "devicectl", "device", "info", "apps", "--device", udid, "--json-output", "/dev/stdout"],
+                       capture_output=True, text=True, timeout=90)
+    try:
+        js = json.loads(p.stdout[p.stdout.index("{"):])
+        return "\n".join(sorted(f"{a.get('name')} · {a.get('bundleIdentifier')}" for a in js["result"]["apps"]))
+    except Exception:
+        die(f"could not list apps: {p.stderr[-300:]}")
+
+
+# =============================== CLI ===============================
+def dispatch(argv: list[str]) -> str:
+    p = argparse.ArgumentParser(prog="ipad", add_help=True)
+    sp = p.add_subparsers(dest="cmd", required=True)
+    x = sp.add_parser("see"); x.add_argument("--no-shot", action="store_true"); x.add_argument("--find"); x.add_argument("--limit", type=int, default=80); x.add_argument("--json", action="store_true")
+    x = sp.add_parser("tap"); x.add_argument("target", nargs="+"); x.add_argument("--why", default=""); x.add_argument("--confirm", action="store_true")
+    x = sp.add_parser("longpress"); x.add_argument("target", nargs="+"); x.add_argument("--sec", type=float, default=1.0)
+    x = sp.add_parser("type"); x.add_argument("text"); x.add_argument("--enter", action="store_true"); x.add_argument("--why", default=""); x.add_argument("--confirm", action="store_true")
+    x = sp.add_parser("swipe"); x.add_argument("args", nargs="+")
+    x = sp.add_parser("open"); x.add_argument("app", nargs="+")
+    x = sp.add_parser("close"); x.add_argument("app", nargs="+")
+    x = sp.add_parser("url"); x.add_argument("url"); x.add_argument("--confirm", action="store_true")
+    x = sp.add_parser("shortcut"); x.add_argument("name"); x.add_argument("--input"); x.add_argument("--confirm", action="store_true")
+    x = sp.add_parser("button"); x.add_argument("name", choices=["home", "lock", "unlock", "volumeUp", "volumeDown"])
+    x = sp.add_parser("alert"); x.add_argument("action", choices=["text", "buttons", "accept", "dismiss"]); x.add_argument("--button"); x.add_argument("--confirm", action="store_true")
+    x = sp.add_parser("wait"); x.add_argument("sec", type=float)
+    x = sp.add_parser("shot"); x.add_argument("--out"); x.add_argument("--full", action="store_true")
+    x = sp.add_parser("run"); x.add_argument("script")
+    x = sp.add_parser("do"); x.add_argument("goal"); x.add_argument("--steps", type=int, default=25)
+    for c in ("status", "doctor", "apps"):
+        sp.add_parser(c)
+    a = p.parse_args(argv)
+    c = a.cmd
+    if c == "see":
+        return see(not a.no_shot, a.limit, a.find, a.json)
+    if c == "tap":
+        return tap(a.target, a.why, a.confirm)
+    if c == "longpress":
+        e = last(int(a.target[0])) if len(a.target) == 1 else {"x": float(a.target[0]), "y": float(a.target[1])}
+        s("POST", "/wda/touchAndHold", {"x": e["x"], "y": e["y"], "duration": a.sec})
+        return f"long-pressed ({e['x']},{e['y']})"
+    if c == "type":
+        return type_text(a.text, a.enter, a.why, a.confirm)
+    if c == "swipe":
+        return swipe(a.args)
+    if c == "open":
+        return open_app(" ".join(a.app))
+    if c == "close":
+        bid = APPS.get(" ".join(a.app).lower(), " ".join(a.app))
+        s("POST", "/wda/apps/terminate", {"bundleId": bid})
+        return f"closed {bid}"
+    if c == "url":
+        return open_url(a.url, a.confirm)
+    if c == "shortcut":
+        return shortcut(a.name, a.input, a.confirm)
+    if c == "button":
+        return button(a.name)
+    if c == "alert":
+        return alert(a.action, a.button, a.confirm)
+    if c == "wait":
+        time.sleep(min(30, a.sec))
+        return f"waited {a.sec}s"
+    if c == "shot":
+        return str(screenshot(Path(a.out) if a.out else None, 2752 if a.full else 1100))
+    if c == "run":
+        return run_batch(a.script)
+    if c == "do":
+        return agent(a.goal, a.steps)
+    if c == "status":
+        return status()
+    if c == "doctor":
+        return doctor()
+    if c == "apps":
+        return apps()
+    return "?"
+
+
+def main():
+    try:
+        say(dispatch(sys.argv[1:]))
+    except Stop as e:
+        print(str(e), file=sys.stderr if e.code != 3 else sys.stdout)
+        sys.exit(e.code)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        print(f"WDA unreachable or busy ({e}). Is the iPad unlocked and on the same network? Try: ipad doctor", file=sys.stderr)
+        sys.exit(4)
+
+
+if __name__ == "__main__":
+    main()

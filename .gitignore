@@ -1,0 +1,5 @@
+assets/shortcuts/raw/
+assets/shortcuts/signed/
+__pycache__/
+*.pyc
+.DS_Store
