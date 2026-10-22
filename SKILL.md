@@ -48,12 +48,13 @@ take a screenshot only when the element list can't answer.
 | Hardware | `ipad button home\|lock\|volumeUp\|volumeDown` |
 | System alerts | `ipad alert text\|buttons\|accept\|dismiss [--button "Allow"]` |
 | Several steps | `ipad run "cmd; cmd; …"` (stops at the first error / approval) · `ipad wait 2` |
+| Draw (real strokes) | `ipad draw logo.svg --tool Pen --color Black` · `--shape star` · `--text "HELLO"` · `--dry-run` → `references/drawing.md` |
 | Optional sub-agent | `ipad do "<goal>"` — fast Gemini vision loop (needs `GEMINI_API_KEY`); same safety gate |
 
 ## Strategy
 - **Shortest path first:** a URL / deep link / Shortcut beats ten taps. Then UI.
 - **Before working in an app, read its playbook** if one exists: `references/apps/<app>.md`
-  (safari, notes, gemini, files, settings). It lists the real labels and the fastest path.
+  (safari, notes, gemini, files, settings, freeform). It lists the real labels and the fastest path.
 - Pick sensible defaults yourself (a good prompt, a title). Don't ask the user to confirm normal steps.
 - If something didn't work, `see` again and try a different approach (max 2 retries of the same idea).
 - iPadOS quirks (multiple windows, keyboard, hidden system sheets, Files rename trap): `references/ipados-26.md`.

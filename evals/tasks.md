@@ -35,4 +35,5 @@ except the approval prompt where the task requires one.
 | E03 | ✅ (stopped for approval) | 5 (`do`) | 64 s | prompt typed; held at «Send query» as designed |
 | E04 | ✅ | 3 | ~25 s | Settings search → «iPadOS Version, 26.5» |
 | E05 | ✅ | 2 | ~10 s | `url maps://?q=Haifa`; location prompt handled with `alert dismiss` |
-| E06–E20 | — | | | to run |
+| E14 | ✅ | `draw` | 6–70 s | star 6 s · NAWA SVG logo 70 s · text 12 s (Freeform) |
+| E06–E13, E15–E20 | — | | | to run |

@@ -15,6 +15,12 @@ agent › ipad see --find Send   →   NEEDS_APPROVAL «Send query»   →   "Se
 agent › ipad tap 0 --confirm; ipad run "wait 12; see"   ✅
 ```
 
+## Claude draws on your iPad ✍️
+`ipad draw logo.svg --tool Pen` turns any SVG (or a shape, or text) into real finger strokes in Freeform / Notes / Procreate.
+
+![Claude drew the NAWA logo and wrote NAWA in Freeform](assets/demo/draw-nawa-freeform.jpg)
+*NAWA logo (SVG, 7 strokes) in 70 s + "NAWA" in 12 s — iPad Pro 13" M5, Freeform. Details: [references/drawing.md](references/drawing.md).*
+
 ## Why it's different
 - **Numbered elements (set-of-marks).** `ipad see` returns the screen's elements as `[7] Button «New note» (702,54)`;
   the agent taps `7`. No pixel guessing.
@@ -23,7 +29,7 @@ agent › ipad tap 0 --confirm; ipad run "wait 12; see"   ✅
 - **iPad-aware.** Field notes for iPadOS 26: multiple windows, hidden system sheets, permission prompts in portrait
   coordinates, the Files rename trap, default-browser surprises — see [`references/ipados-26.md`](references/ipados-26.md).
 - **Safety gate built in.** Send / post / pay / delete / sign-out are held until the user says yes (`--confirm`).
-- **App playbooks.** Real labels + fastest paths: Safari, Notes, Gemini, Files, Settings — more welcome by PR.
+- **App playbooks.** Real labels + fastest paths: Safari, Notes, Gemini, Files, Settings, Freeform — more welcome by PR.
 - **Zero dependencies.** One Python 3.9 stdlib script + Apple's own XCUITest via WebDriverAgent.
 
 ## Install
@@ -36,7 +42,7 @@ Needs a Mac with Xcode, an Apple ID signed in to Xcode (paid = 1-year signature,
 and the iPad with Developer Mode on. Full guide: [`references/setup.md`](references/setup.md).
 
 ## Commands
-`see` · `tap N` · `type` · `swipe` · `open` · `url` · `shortcut` · `alert` · `button` · `run "a; b; c"` · `doctor` · `status` ·
+`see` · `tap N` · `type` · `swipe` · `open` · `url` · `shortcut` · `alert` · `button` · `run "a; b; c"` · `draw` · `doctor` · `status` ·
 `do "<goal>"` (optional Gemini sub-agent). Details in [`SKILL.md`](SKILL.md).
 
 ## Evals

@@ -387,6 +387,287 @@ def agent(goal: str, steps: int = 25) -> str:
     return json.dumps({"status": "max_steps", "steps": steps, "log": hist[-6:]}, ensure_ascii=False, indent=1)
 
 
+# =============================== drawing ===============================
+# Real finger strokes (W3C touch actions) in Freeform / Notes / Procreate. Measured on iPad Pro M5 + iPadOS 26.5:
+# each point costs ~0.55 s whatever the duration, and very long strokes (~70+ points) can be dropped by the app,
+# so strokes are simplified (Ramer–Douglas–Peucker) and split into chunks of ≤ MAX_PTS points.
+import math as _m
+import xml.etree.ElementTree as _ET
+
+MAX_PTS = 28
+SEC_PER_PT = 0.55
+CANVAS = (180, 130, 1016, 720)   # x, y, w, h in points — clear of Freeform's top bar and the bottom tool palette
+
+FONT = {  # single-stroke font on a 4×6 grid (y down)
+    "A": [[(0, 6), (2, 0), (4, 6)], [(1, 3.5), (3, 3.5)]],
+    "B": [[(0, 6), (0, 0), (3, 0), (4, 1), (4, 2), (3, 3), (0, 3)], [(3, 3), (4, 4), (4, 5), (3, 6), (0, 6)]],
+    "C": [[(4, 1), (3, 0), (1, 0), (0, 1), (0, 5), (1, 6), (3, 6), (4, 5)]],
+    "D": [[(0, 0), (0, 6), (2.5, 6), (4, 4.5), (4, 1.5), (2.5, 0), (0, 0)]],
+    "E": [[(4, 0), (0, 0), (0, 6), (4, 6)], [(0, 3), (3, 3)]],
+    "F": [[(4, 0), (0, 0), (0, 6)], [(0, 3), (3, 3)]],
+    "G": [[(4, 1), (3, 0), (1, 0), (0, 1), (0, 5), (1, 6), (3, 6), (4, 5), (4, 3.5), (2.5, 3.5)]],
+    "H": [[(0, 0), (0, 6)], [(4, 0), (4, 6)], [(0, 3), (4, 3)]],
+    "I": [[(1, 0), (3, 0)], [(2, 0), (2, 6)], [(1, 6), (3, 6)]],
+    "J": [[(4, 0), (4, 5), (3, 6), (1, 6), (0, 5)]],
+    "K": [[(0, 0), (0, 6)], [(4, 0), (0, 3.5)], [(1.3, 2.6), (4, 6)]],
+    "L": [[(0, 0), (0, 6), (4, 6)]],
+    "M": [[(0, 6), (0, 0), (2, 3), (4, 0), (4, 6)]],
+    "N": [[(0, 6), (0, 0), (4, 6), (4, 0)]],
+    "O": [[(1, 0), (3, 0), (4, 1), (4, 5), (3, 6), (1, 6), (0, 5), (0, 1), (1, 0)]],
+    "P": [[(0, 6), (0, 0), (3, 0), (4, 1), (4, 2), (3, 3), (0, 3)]],
+    "Q": [[(1, 0), (3, 0), (4, 1), (4, 5), (3, 6), (1, 6), (0, 5), (0, 1), (1, 0)], [(2.5, 4.5), (4, 6)]],
+    "R": [[(0, 6), (0, 0), (3, 0), (4, 1), (4, 2), (3, 3), (0, 3)], [(2, 3), (4, 6)]],
+    "S": [[(4, 1), (3, 0), (1, 0), (0, 1), (0, 2), (1, 3), (3, 3), (4, 4), (4, 5), (3, 6), (1, 6), (0, 5)]],
+    "T": [[(0, 0), (4, 0)], [(2, 0), (2, 6)]],
+    "U": [[(0, 0), (0, 5), (1, 6), (3, 6), (4, 5), (4, 0)]],
+    "V": [[(0, 0), (2, 6), (4, 0)]],
+    "W": [[(0, 0), (1, 6), (2, 3), (3, 6), (4, 0)]],
+    "X": [[(0, 0), (4, 6)], [(4, 0), (0, 6)]],
+    "Y": [[(0, 0), (2, 3), (4, 0)], [(2, 3), (2, 6)]],
+    "Z": [[(0, 0), (4, 0), (0, 6), (4, 6)]],
+    "0": [[(1, 0), (3, 0), (4, 1), (4, 5), (3, 6), (1, 6), (0, 5), (0, 1), (1, 0)], [(4, 1), (0, 5)]],
+    "1": [[(1, 1), (2, 0), (2, 6)], [(1, 6), (3, 6)]],
+    "2": [[(0, 1), (1, 0), (3, 0), (4, 1), (4, 2), (0, 6), (4, 6)]],
+    "3": [[(0, 0), (4, 0), (2, 2.5), (3, 2.5), (4, 3.5), (4, 5), (3, 6), (1, 6), (0, 5)]],
+    "4": [[(3, 6), (3, 0), (0, 4), (4, 4)]],
+    "5": [[(4, 0), (0, 0), (0, 3), (3, 3), (4, 4), (4, 5), (3, 6), (0, 6)]],
+    "6": [[(3, 0), (1, 0), (0, 1), (0, 5), (1, 6), (3, 6), (4, 5), (4, 4), (3, 3), (0, 3)]],
+    "7": [[(0, 0), (4, 0), (1.5, 6)]],
+    "8": [[(1, 3), (0, 2), (0, 1), (1, 0), (3, 0), (4, 1), (4, 2), (3, 3), (1, 3), (0, 4), (0, 5), (1, 6), (3, 6), (4, 5), (4, 4), (3, 3)]],
+    "9": [[(4, 3), (1, 3), (0, 2), (0, 1), (1, 0), (3, 0), (4, 1), (4, 5), (3, 6), (1, 6)]],
+    "-": [[(1, 3), (3, 3)]], ".": [[(2, 5.6), (2, 6)]], "!": [[(2, 0), (2, 4.2)], [(2, 5.6), (2, 6)]],
+    "?": [[(0, 1), (1, 0), (3, 0), (4, 1), (4, 2), (2, 3.5), (2, 4.2)], [(2, 5.6), (2, 6)]],
+}
+
+
+def _shape(name: str) -> list:
+    n = name.lower()
+    if n == "circle":
+        return [[(_m.cos(2 * _m.pi * i / 24), _m.sin(2 * _m.pi * i / 24)) for i in range(25)]]
+    if n == "star":
+        return [[((1 if i % 2 == 0 else .42) * _m.cos(-_m.pi / 2 + i * _m.pi / 5),
+                  (1 if i % 2 == 0 else .42) * _m.sin(-_m.pi / 2 + i * _m.pi / 5)) for i in range(11)]]
+    if n == "heart":
+        return [[(16 * _m.sin(t) ** 3, -(13 * _m.cos(t) - 5 * _m.cos(2 * t) - 2 * _m.cos(3 * t) - _m.cos(4 * t)))
+                 for t in [2 * _m.pi * i / 60 for i in range(61)]]]
+    if n == "spiral":
+        return [[(t * _m.cos(t), t * _m.sin(t)) for t in [i * .25 for i in range(0, 76)]]]
+    if n == "wave":
+        return [[(i / 40, .25 * _m.sin(4 * _m.pi * i / 40)) for i in range(41)]]
+    die("shapes: circle, star, heart, spiral, wave")
+
+
+def _text(text: str) -> list:
+    strokes, x0 = [], 0.0
+    for ch in text.upper():
+        if ch == " ":
+            x0 += 4
+            continue
+        g = FONT.get(ch)
+        if not g:
+            die(f"the built-in font has A–Z, 0–9 and - . ! ? (got «{ch}»). For other scripts draw an SVG of the text.")
+        strokes += [[(x0 + x, y) for x, y in st] for st in g]
+        x0 += 6
+    return strokes
+
+
+# ---- SVG → polylines ----
+def _mat_mul(a, b):
+    return (a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1], a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3],
+            a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5])
+
+
+def _parse_transform(t: str):
+    m = (1, 0, 0, 1, 0, 0)
+    for name, args in re.findall(r"(\w+)\s*\(([^)]*)\)", t or ""):
+        v = [float(x) for x in re.findall(r"-?[\d.]+(?:e-?\d+)?", args)]
+        if name == "matrix" and len(v) == 6:
+            n = tuple(v)
+        elif name == "translate":
+            n = (1, 0, 0, 1, v[0], v[1] if len(v) > 1 else 0)
+        elif name == "scale":
+            n = (v[0], 0, 0, v[1] if len(v) > 1 else v[0], 0, 0)
+        elif name == "rotate":
+            a = _m.radians(v[0]); c, s_ = _m.cos(a), _m.sin(a)
+            n = (c, s_, -s_, c, 0, 0)
+            if len(v) == 3:
+                n = _mat_mul(_mat_mul((1, 0, 0, 1, v[1], v[2]), n), (1, 0, 0, 1, -v[1], -v[2]))
+        else:
+            continue
+        m = _mat_mul(m, n)
+    return m
+
+
+def _bez(p0, p1, p2, p3, n=14):
+    return [(((1 - t) ** 3) * p0[0] + 3 * ((1 - t) ** 2) * t * p1[0] + 3 * (1 - t) * t * t * p2[0] + t ** 3 * p3[0],
+             ((1 - t) ** 3) * p0[1] + 3 * ((1 - t) ** 2) * t * p1[1] + 3 * (1 - t) * t * t * p2[1] + t ** 3 * p3[1])
+            for t in [i / n for i in range(1, n + 1)]]
+
+
+def _path(d: str) -> list:
+    toks = re.findall(r"[MmLlHhVvCcSsQqTtAaZz]|-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?", d)
+    out, cur, start, i, cmd, last_c = [], None, (0, 0), 0, None, None
+    pos = (0.0, 0.0)
+
+    def num():
+        nonlocal i
+        i += 1
+        return float(toks[i - 1])
+    while i < len(toks):
+        if re.match(r"[A-Za-z]", toks[i]):
+            cmd = toks[i]; i += 1
+            if cmd in "Zz":
+                if cur:
+                    cur.append(start); out.append(cur)
+                cur, pos, last_c = None, start, None
+                continue
+        rel = cmd.islower(); C = cmd.upper()
+        ox, oy = pos if rel else (0, 0)
+        if C == "M":
+            pos = (num() + ox, num() + oy)
+            if cur:
+                out.append(cur)
+            cur, start = [pos], pos
+            cmd = "l" if rel else "L"
+            last_c = None
+        elif C == "L":
+            pos = (num() + ox, num() + oy); cur.append(pos); last_c = None
+        elif C == "H":
+            pos = (num() + ox, pos[1]); cur.append(pos); last_c = None
+        elif C == "V":
+            pos = (pos[0], num() + (pos[1] if rel else 0)); cur.append(pos); last_c = None
+        elif C == "C":
+            p1 = (num() + ox, num() + oy); p2 = (num() + ox, num() + oy); p3 = (num() + ox, num() + oy)
+            cur += _bez(pos, p1, p2, p3); pos, last_c = p3, p2
+        elif C == "S":
+            p1 = (2 * pos[0] - last_c[0], 2 * pos[1] - last_c[1]) if last_c else pos
+            p2 = (num() + ox, num() + oy); p3 = (num() + ox, num() + oy)
+            cur += _bez(pos, p1, p2, p3); pos, last_c = p3, p2
+        elif C in "QT":
+            q = (num() + ox, num() + oy) if C == "Q" else ((2 * pos[0] - last_c[0], 2 * pos[1] - last_c[1]) if last_c else pos)
+            p3 = (num() + ox, num() + oy)
+            p1 = (pos[0] + 2 / 3 * (q[0] - pos[0]), pos[1] + 2 / 3 * (q[1] - pos[1]))
+            p2 = (p3[0] + 2 / 3 * (q[0] - p3[0]), p3[1] + 2 / 3 * (q[1] - p3[1]))
+            cur += _bez(pos, p1, p2, p3); pos, last_c = p3, q
+        elif C == "A":   # arcs approximated by their chord end point (good enough for icons; flatten arcs in your editor for curves)
+            for _ in range(5):
+                num()
+            pos = (num() + ox, num() + oy); cur.append(pos); last_c = None
+        else:
+            i += 1
+    if cur:
+        out.append(cur)
+    return [p for p in out if len(p) > 1]
+
+
+def _svg(path: Path) -> list:
+    root = _ET.parse(path).getroot()
+    strokes = []
+
+    def apply(m, pts):
+        return [(m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]) for x, y in pts]
+
+    def walk(el, m):
+        m = _mat_mul(m, _parse_transform(el.get("transform")))
+        tag = el.tag.split("}")[-1]
+        f = lambda k, d=0.0: float(re.sub(r"[^\d.\-e]", "", el.get(k, str(d))) or d)
+        if tag == "path":
+            strokes.extend(apply(m, p) for p in _path(el.get("d", "")))
+        elif tag in ("polyline", "polygon"):
+            v = [float(x) for x in re.findall(r"-?[\d.]+", el.get("points", ""))]
+            pts = list(zip(v[0::2], v[1::2]))
+            if tag == "polygon" and pts:
+                pts.append(pts[0])
+            strokes.append(apply(m, pts))
+        elif tag == "line":
+            strokes.append(apply(m, [(f("x1"), f("y1")), (f("x2"), f("y2"))]))
+        elif tag == "rect":
+            x, y, w, h = f("x"), f("y"), f("width"), f("height")
+            strokes.append(apply(m, [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]))
+        elif tag in ("circle", "ellipse"):
+            cx, cy = f("cx"), f("cy")
+            rx = f("r") if tag == "circle" else f("rx"); ry = f("r") if tag == "circle" else f("ry")
+            strokes.append(apply(m, [(cx + rx * _m.cos(2 * _m.pi * i / 32), cy + ry * _m.sin(2 * _m.pi * i / 32)) for i in range(33)]))
+        for c in el:
+            if c.tag.split("}")[-1] not in ("defs", "clipPath", "mask", "style", "title", "desc"):
+                walk(c, m)
+    walk(root, (1, 0, 0, 1, 0, 0))
+    return [s_ for s_ in strokes if len(s_) > 1]
+
+
+def _rdp(pts, eps):
+    if len(pts) < 3:
+        return pts
+    (x1, y1), (x2, y2) = pts[0], pts[-1]
+    dx, dy = x2 - x1, y2 - y1
+    norm = _m.hypot(dx, dy) or 1e-9
+    dmax, idx = 0.0, 0
+    for k in range(1, len(pts) - 1):
+        d = abs(dy * pts[k][0] - dx * pts[k][1] + x2 * y1 - y2 * x1) / norm if _m.hypot(dx, dy) > 1e-9 else _m.hypot(pts[k][0] - x1, pts[k][1] - y1)
+        if d > dmax:
+            dmax, idx = d, k
+    if dmax > eps:
+        return _rdp(pts[:idx + 1], eps)[:-1] + _rdp(pts[idx:], eps)
+    return [pts[0], pts[-1]]
+
+
+def plan_strokes(strokes: list, box=CANVAS, detail=1.5) -> list:
+    xs = [x for st in strokes for x, _ in st]; ys = [y for st in strokes for _, y in st]
+    if not xs:
+        die("nothing to draw")
+    w, h = (max(xs) - min(xs)) or 1, (max(ys) - min(ys)) or 1
+    k = min(box[2] / w, box[3] / h)
+    ox = box[0] + (box[2] - w * k) / 2 - min(xs) * k; oy = box[1] + (box[3] - h * k) / 2 - min(ys) * k
+    out = []
+    for st in strokes:
+        p = _rdp([(x * k + ox, y * k + oy) for x, y in st], detail)
+        if len(p) == 2 and _m.hypot(p[0][0] - p[1][0], p[0][1] - p[1][1]) < 2:
+            p = [p[0], (p[0][0] + 2, p[0][1] + 2)]          # dots → tiny stroke
+        while len(p) > MAX_PTS:
+            out.append(p[:MAX_PTS]); p = p[MAX_PTS - 1:]
+        out.append(p)
+    return out
+
+
+def _pick(label: str) -> bool:
+    for e in elements():
+        if e["label"].lower() == label.lower() and e["type"] == "Button":
+            s("POST", "/wda/tap", {"x": e["x"], "y": e["y"]})
+            time.sleep(0.6)
+            return True
+    return False
+
+
+def _one_stroke(p) -> str | None:
+    acts = [{"type": "pointerMove", "duration": 0, "x": round(p[0][0], 1), "y": round(p[0][1], 1)}, {"type": "pointerDown", "button": 0}]
+    acts += [{"type": "pointerMove", "duration": 20, "x": round(x, 1), "y": round(y, 1)} for x, y in p[1:]]
+    acts.append({"type": "pointerUp", "button": 0})
+    r = s("POST", "/actions", {"actions": [{"type": "pointer", "id": "finger", "parameters": {"pointerType": "touch"}, "actions": acts}]}, timeout=180)
+    return err(r)
+
+
+def draw(source: str, kind: str, box=None, detail=1.5, tool=None, color=None, dry=False) -> str:
+    raw = _svg(Path(source).expanduser()) if kind == "svg" else _shape(source) if kind == "shape" else _text(source)
+    plan = plan_strokes(raw, box or CANVAS, detail)
+    npts = sum(len(p) for p in plan)
+    HOME.mkdir(parents=True, exist_ok=True)
+    prev = SHOTS / "draw-preview.svg"; SHOTS.mkdir(parents=True, exist_ok=True)
+    prev.write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1376 1032" style="background:#fff">' +
+                    "".join(f'<polyline fill="none" stroke="#111" stroke-width="3" points="{" ".join(f"{x:.0f},{y:.0f}" for x, y in p)}"/>' for p in plan) + "</svg>")
+    head = f"{len(plan)} strokes · {npts} points · ≈{npts * SEC_PER_PT / 60:.1f} min · preview: {prev}"
+    if dry:
+        return head + "\n(dry run — nothing drawn)"
+    picked = [lbl for lbl in (tool, color) if lbl and _pick(lbl)]
+    t0, fails = time.time(), 0
+    for i, p in enumerate(plan, 1):
+        if _one_stroke(p):
+            fails += 1
+        print(f"  stroke {i}/{len(plan)}", file=sys.stderr, flush=True)
+    audit("draw", kind=kind, source=str(source)[:80], strokes=len(plan), points=npts, failed=fails)
+    return f"{head}\ndrew {len(plan) - fails}/{len(plan)} strokes in {time.time() - t0:.0f}s" + (f" · picked {', '.join(picked)}" if picked else "") + \
+        "\nTip: in Freeform/Notes select a pen first (`see --find Pen`), or pass --tool Pen --color Black."
+
+
 # =============================== doctor / status ===============================
 def doctor() -> str:
     lines = []
@@ -446,6 +727,11 @@ def dispatch(argv: list[str]) -> str:
     x = sp.add_parser("shot"); x.add_argument("--out"); x.add_argument("--full", action="store_true")
     x = sp.add_parser("run"); x.add_argument("script")
     x = sp.add_parser("do"); x.add_argument("goal"); x.add_argument("--steps", type=int, default=25)
+    x = sp.add_parser("draw"); x.add_argument("source", nargs="?", help="SVG file (or use --shape / --text)")
+    x.add_argument("--shape"); x.add_argument("--text"); x.add_argument("--box", help="x,y,w,h in points")
+    x.add_argument("--detail", type=float, default=1.5, help="simplification in points (higher = fewer points, faster)")
+    x.add_argument("--tool", help="e.g. Pen, Marker, Pencil"); x.add_argument("--color", help="e.g. Black, Blue, Red")
+    x.add_argument("--dry-run", action="store_true")
     for c in ("status", "doctor", "apps"):
         sp.add_parser(c)
     a = p.parse_args(argv)
@@ -485,6 +771,12 @@ def dispatch(argv: list[str]) -> str:
         return run_batch(a.script)
     if c == "do":
         return agent(a.goal, a.steps)
+    if c == "draw":
+        kind, src = ("shape", a.shape) if a.shape else ("text", a.text) if a.text else ("svg", a.source)
+        if not src:
+            die("ipad draw <file.svg> | --shape star | --text 'HELLO'")
+        box = tuple(float(v) for v in a.box.split(",")) if a.box else None
+        return draw(src, kind, box, a.detail, a.tool, a.color, a.dry_run)
     if c == "status":
         return status()
     if c == "doctor":
