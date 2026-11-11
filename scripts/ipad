@@ -394,8 +394,10 @@ def agent(goal: str, steps: int = 25) -> str:
 import math as _m
 import xml.etree.ElementTree as _ET
 
-MAX_PTS = 28
-SEC_PER_PT = 0.55
+MAX_PTS = 26
+SEC_PER_PT = 0.9                 # measured: ~0.58 s per pointerMove inside WDA + dwell pauses + ~0.6 s per stroke
+# Dwell recipe — without it Freeform/PencilKit swallows the first and last part of every stroke and rounds corners
+START_DWELL, CORNER_DWELL, END_DWELL, CORNER_DEG = 100, 110, 200, 30      # ms, ms, ms, degrees
 CANVAS = (180, 130, 1016, 720)   # x, y, w, h in points — clear of Freeform's top bar and the bottom tool palette
 
 FONT = {  # single-stroke font on a 4×6 grid (y down)
@@ -437,6 +439,8 @@ FONT = {  # single-stroke font on a 4×6 grid (y down)
     "9": [[(4, 3), (1, 3), (0, 2), (0, 1), (1, 0), (3, 0), (4, 1), (4, 5), (3, 6), (1, 6)]],
     "-": [[(1, 3), (3, 3)]], ".": [[(2, 5.6), (2, 6)]], "!": [[(2, 0), (2, 4.2)], [(2, 5.6), (2, 6)]],
     "?": [[(0, 1), (1, 0), (3, 0), (4, 1), (4, 2), (2, 3.5), (2, 4.2)], [(2, 5.6), (2, 6)]],
+    "=": [[(0.5, 2.2), (3.5, 2.2)], [(0.5, 3.8), (3.5, 3.8)]], "/": [[(3.6, 0), (0.4, 6)]],
+    ":": [[(2, 1.8), (2, 2.3)], [(2, 4.4), (2, 4.9)]], "+": [[(0.5, 3), (3.5, 3)], [(2, 1.5), (2, 4.5)]],
 }
 
 
@@ -465,7 +469,7 @@ def _text(text: str) -> list:
             continue
         g = FONT.get(ch)
         if not g:
-            die(f"the built-in font has A–Z, 0–9 and - . ! ? (got «{ch}»). For other scripts draw an SVG of the text.")
+            die(f"the built-in font has A–Z, 0–9 and - . ! ? = / : + (got «{ch}»). For other scripts draw an SVG of the text.")
         strokes += [[(x0 + x, y) for x, y in st] for st in g]
         x0 += 6
     return strokes
@@ -623,6 +627,8 @@ def plan_strokes(strokes: list, box=CANVAS, detail=1.5) -> list:
         p = _rdp([(x * k + ox, y * k + oy) for x, y in st], detail)
         if len(p) == 2 and _m.hypot(p[0][0] - p[1][0], p[0][1] - p[1][1]) < 2:
             p = [p[0], (p[0][0] + 2, p[0][1] + 2)]          # dots → tiny stroke
+        if len(p) > 3 and _m.hypot(p[0][0] - p[-1][0], p[0][1] - p[-1][1]) < 0.5:
+            p = p + [p[1]]                                   # closed shape → overlap one segment so it really closes
         while len(p) > MAX_PTS:
             out.append(p[:MAX_PTS]); p = p[MAX_PTS - 1:]
         out.append(p)
@@ -638,16 +644,46 @@ def _pick(label: str) -> bool:
     return False
 
 
+def _corners(p, deg=CORNER_DEG) -> set:
+    c = set()
+    for i in range(1, len(p) - 1):
+        a1 = _m.atan2(p[i][1] - p[i - 1][1], p[i][0] - p[i - 1][0]); a2 = _m.atan2(p[i + 1][1] - p[i][1], p[i + 1][0] - p[i][0])
+        if _m.degrees(abs((a2 - a1 + _m.pi) % (2 * _m.pi) - _m.pi)) > deg:
+            c.add(i)
+    return c
+
+
 def _one_stroke(p) -> str | None:
-    acts = [{"type": "pointerMove", "duration": 0, "x": round(p[0][0], 1), "y": round(p[0][1], 1)}, {"type": "pointerDown", "button": 0}]
-    acts += [{"type": "pointerMove", "duration": 20, "x": round(x, 1), "y": round(y, 1)} for x, y in p[1:]]
-    acts.append({"type": "pointerUp", "button": 0})
-    r = s("POST", "/actions", {"actions": [{"type": "pointer", "id": "finger", "parameters": {"pointerType": "touch"}, "actions": acts}]}, timeout=180)
-    return err(r)
+    """One finger stroke with dwell pauses: after touch-down, at every sharp corner, and before lift-off."""
+    cs = _corners(p)
+    mv = int(min(400, max(60, 0.6 * max(_m.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(p, p[1:])))))   # ms per move, scaled to the longest segment
+    acts = [{"type": "pointerMove", "duration": 0, "x": round(p[0][0], 1), "y": round(p[0][1], 1)}, {"type": "pointerDown", "button": 0},
+            {"type": "pause", "duration": START_DWELL}]
+    for i, (x, y) in enumerate(p[1:], 1):
+        acts.append({"type": "pointerMove", "duration": mv, "x": round(x, 1), "y": round(y, 1)})
+        if i in cs:
+            acts.append({"type": "pause", "duration": CORNER_DWELL})
+    acts += [{"type": "pause", "duration": END_DWELL}, {"type": "pointerUp", "button": 0}]
+    body = {"actions": [{"type": "pointer", "id": "finger", "parameters": {"pointerType": "touch"}, "actions": acts}]}
+    e = "not sent"
+    for attempt in range(3):                                 # a WDA request can stall — retry instead of killing a 40-minute drawing
+        try:
+            e = err(s("POST", "/actions", body, timeout=60))
+        except Stop as ex:
+            e = str(ex)
+        except Exception as ex:
+            e = f"{type(ex).__name__}: {ex}"
+        if not e:
+            return None
+        time.sleep(3)
+    return e
 
 
-def draw(source: str, kind: str, box=None, detail=1.5, tool=None, color=None, dry=False) -> str:
+def draw(source: str, kind: str, box=None, detail=1.5, tool=None, color=None, dry=False, exact=False) -> str:
     raw = _svg(Path(source).expanduser()) if kind == "svg" else _shape(source) if kind == "shape" else _text(source)
+    if exact:                                                # coordinates are already screen points (layered, multi-colour drawings)
+        xs = [x for st in raw for x, _ in st]; ys = [y for st in raw for _, y in st]
+        box = (min(xs), min(ys), (max(xs) - min(xs)) or 1, (max(ys) - min(ys)) or 1) if xs else box
     plan = plan_strokes(raw, box or CANVAS, detail)
     npts = sum(len(p) for p in plan)
     HOME.mkdir(parents=True, exist_ok=True)
@@ -665,7 +701,7 @@ def draw(source: str, kind: str, box=None, detail=1.5, tool=None, color=None, dr
         print(f"  stroke {i}/{len(plan)}", file=sys.stderr, flush=True)
     audit("draw", kind=kind, source=str(source)[:80], strokes=len(plan), points=npts, failed=fails)
     return f"{head}\ndrew {len(plan) - fails}/{len(plan)} strokes in {time.time() - t0:.0f}s" + (f" · picked {', '.join(picked)}" if picked else "") + \
-        "\nTip: in Freeform/Notes select a pen first (`see --find Pen`), or pass --tool Pen --color Black."
+        "\nTip: in Freeform/Notes select a tool first (`see --find Monoline`), or pass --tool Monoline --color Black."
 
 
 # =============================== doctor / status ===============================
@@ -730,8 +766,9 @@ def dispatch(argv: list[str]) -> str:
     x = sp.add_parser("draw"); x.add_argument("source", nargs="?", help="SVG file (or use --shape / --text)")
     x.add_argument("--shape"); x.add_argument("--text"); x.add_argument("--box", help="x,y,w,h in points")
     x.add_argument("--detail", type=float, default=1.5, help="simplification in points (higher = fewer points, faster)")
-    x.add_argument("--tool", help="e.g. Pen, Marker, Pencil"); x.add_argument("--color", help="e.g. Black, Blue, Red")
+    x.add_argument("--tool", help="e.g. Monoline, Pen, Marker"); x.add_argument("--color", help="e.g. Black, Blue, Red")
     x.add_argument("--dry-run", action="store_true")
+    x.add_argument("--exact", action="store_true", help="SVG coordinates are already screen points — do not fit to a box")
     for c in ("status", "doctor", "apps"):
         sp.add_parser(c)
     a = p.parse_args(argv)
@@ -776,7 +813,7 @@ def dispatch(argv: list[str]) -> str:
         if not src:
             die("ipad draw <file.svg> | --shape star | --text 'HELLO'")
         box = tuple(float(v) for v in a.box.split(",")) if a.box else None
-        return draw(src, kind, box, a.detail, a.tool, a.color, a.dry_run)
+        return draw(src, kind, box, a.detail, a.tool, a.color, a.dry_run, a.exact)
     if c == "status":
         return status()
     if c == "doctor":

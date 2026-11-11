@@ -16,10 +16,14 @@ agent › ipad tap 0 --confirm; ipad run "wait 12; see"   ✅
 ```
 
 ## Claude draws on your iPad ✍️
-`ipad draw logo.svg --tool Pen` turns any SVG (or a shape, or text) into real finger strokes in Freeform / Notes / Procreate.
+`ipad draw sheet.svg --tool Monoline --color Black` turns any SVG (or a shape, or text) into real finger strokes in Freeform / Notes / Procreate.
 
-![Claude drew the NAWA logo and wrote NAWA in Freeform](assets/demo/draw-nawa-freeform.jpg)
-*NAWA logo (SVG, 7 strokes) in 70 s + "NAWA" in 12 s — iPad Pro 13" M5, Freeform. Details: [references/drawing.md](references/drawing.md).*
+![A foldable survey-drone engineering sheet, drawn stroke by stroke in Freeform](assets/demo/draw-sky380-freeform.jpg)
+*"Engineer a survey drone and draw it on my iPad": Claude sized the airframe, then drew the whole sheet with touch strokes —
+702 strokes, about 3,000 touch points, about 48 minutes on an iPad Pro 13" M5 (Freeform, Monoline pen, dot grid). Nobody touched the iPad.*
+
+Strokes come out crisp because every stroke dwells briefly after touch-down, at each sharp corner and before lift-off
+(without that, Freeform swallows the start and end of a stroke and rounds its corners). Details: [references/drawing.md](references/drawing.md).
 
 ## Why it's different
 - **Numbered elements (set-of-marks).** `ipad see` returns the screen's elements as `[7] Button «New note» (702,54)`;
