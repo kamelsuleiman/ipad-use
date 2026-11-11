@@ -18,3 +18,9 @@
 - First launch shows *Welcome* and *What's New* sheets → «Continue» twice.
 - A «Browse the Content Hub» tip may cover the top right on a new board → its «Close».
 - The palette covers y ≈ 880–1000 — keep drawings above it (the default `draw` box does).
+- **Monoline** («Monoline», third tool in the palette) gives a uniform thin line — the best tool for technical drawings and small text.
+- «Grid» (bottom right) toggles a dot grid; it makes a board look like engineering paper.
+- The first time the drawing tools open, an *Improve Handwriting Readability* sheet appears → «Not now» (auto-refine would reshape drawn text).
+- **Math Notes**: handwriting that ends in «=» (e.g. after an undo leaves `147 + 12 =`) pops a modal «Solve» menu that swallows
+  the following taps. Dismiss it with a tap on an empty part of the top bar (e.g. `tap 350 54 --why "dismiss Solve"`), then continue.
+- A tap on the canvas while a pen is selected draws a dot — never tap the canvas to dismiss something.

@@ -48,7 +48,7 @@ take a screenshot only when the element list can't answer.
 | Hardware | `ipad button home\|lock\|volumeUp\|volumeDown` |
 | System alerts | `ipad alert text\|buttons\|accept\|dismiss [--button "Allow"]` |
 | Several steps | `ipad run "cmd; cmd; …"` (stops at the first error / approval) · `ipad wait 2` |
-| Draw (real strokes) | `ipad draw logo.svg --tool Pen --color Black` · `--shape star` · `--text "HELLO"` · `--dry-run` → `references/drawing.md` |
+| Draw (real strokes) | `ipad draw logo.svg --tool Monoline --color Black` · `--shape star` · `--text "HELLO"` · `--exact` (SVG already in screen points) · `--dry-run` → `references/drawing.md` |
 | Optional sub-agent | `ipad do "<goal>"` — fast Gemini vision loop (needs `GEMINI_API_KEY`); same safety gate |
 
 ## Strategy
