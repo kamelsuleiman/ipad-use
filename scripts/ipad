@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ipad — let an AI agent see and drive a real iPad over Wi-Fi (WebDriverAgent). Python 3.9+, stdlib only.
+"""ipad — let an AI agent see and drive a real iPad or iPhone over Wi-Fi (WebDriverAgent). Python 3.9+, stdlib only.
 
 Core loop:   ipad see            → screenshot + NUMBERED on-screen elements
              ipad tap 7          → tap element #7 from the last `see`
@@ -51,7 +51,7 @@ APPS = {
     "facetime": "com.apple.facetime", "contacts": "com.apple.MobileAddressBook", "books": "com.apple.iBooks",
     "podcasts": "com.apple.podcasts", "tv": "com.apple.tv", "translate": "com.apple.Translate", "journal": "com.apple.journal",
     "chrome": "com.google.chrome.ios", "gemini": "com.google.gemini", "chatgpt": "com.openai.chat",
-    "claude": "com.anthropic.claudeforios", "youtube": "com.google.ios.youtube", "instagram": "com.burbn.instagram",
+    "claude": "com.anthropic.claude", "garageband": "com.apple.mobilegarageband", "youtube": "com.google.ios.youtube", "instagram": "com.burbn.instagram",
     "whatsapp": "net.whatsapp.WhatsApp", "procreate": "com.savage.procreate", "google earth": "com.google.b612",
     # Arabic aliases
     "الإعدادات": "com.apple.Preferences", "سفاري": "com.apple.mobilesafari", "ملاحظات": "com.apple.mobilenotes",
@@ -82,7 +82,7 @@ def wda_url() -> str:
         pass
     if cfg().get("wda_url"):
         return cfg()["wda_url"].rstrip("/")
-    die("WDA URL unknown. Run scripts/setup.sh, or set IPAD_WDA_URL=http://<ipad-ip>:8100", 2)
+    die("WDA URL unknown. Run scripts/setup.sh, or set IPAD_WDA_URL=http://<device-ip>:8100", 2)
 
 
 def http(method: str, path: str, body=None, timeout: float = 30):
@@ -108,10 +108,14 @@ def session() -> str:
         sid = json.loads(SESSION.read_text()).get("id")
         if sid and not err(http("GET", f"/session/{sid}", timeout=10)):
             return sid
-    r = http("POST", "/session", {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False}}}, timeout=60)
-    sid = r.get("sessionId") or (r.get("value") or {}).get("sessionId")
+    live = http("GET", "/status", timeout=8).get("sessionId")
+    if live and not err(http("GET", f"/session/{live}", timeout=10)):
+        sid = live
+    else:
+        r = http("POST", "/session", {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False}}}, timeout=60)
+        sid = r.get("sessionId") or (r.get("value") or {}).get("sessionId")
     if not sid:
-        die(f"could not open a WDA session: {r}")
+        die("could not open a WDA session")
     HOME.mkdir(parents=True, exist_ok=True)
     SESSION.write_text(json.dumps({"id": sid}))
     return sid
@@ -142,11 +146,41 @@ def say(obj):
 
 
 def active_app() -> str | None:
-    return (http("GET", "/wda/activeAppInfo", timeout=8).get("value") or {}).get("bundleId")
+    return (http("GET", "/wda/activeAppInfo", timeout=25).get("value") or {}).get("bundleId")
+
+
+_DEV: dict = {}
+
+
+def device() -> dict:
+    """Real device facts from WDA: kind (ipad|iphone), screen size in points, orientation. Cached per call."""
+    if _DEV:
+        return _DEV
+    st = http("GET", "/status", timeout=8).get("value") or {}
+    kind = (st.get("device") or "ipad").lower()
+    # /wda/screen and /orientation answer in milliseconds. /window/size asks the foreground app and was measured at
+    # ~20 s with WhatsApp's chat list in front, so it is only the last resort.
+    sc = (http("GET", "/wda/screen", timeout=8).get("value") or {}).get("screenSize") or {}
+    w, h = int(sc.get("width") or 0), int(sc.get("height") or 0)
+    try:
+        o = s("GET", "/orientation", timeout=6).get("value")
+    except Exception:
+        o = None
+    if w and h and isinstance(o, str) and o.upper().startswith("LANDSCAPE") != (w > h):
+        w, h = h, w                                     # /wda/screen reports the natural (unrotated) size
+    if not (w and h):
+        sz = s("GET", "/window/size", timeout=45).get("value") or {}
+        w, h = int(sz.get("width") or 1376), int(sz.get("height") or 1032)
+    _DEV.update(kind=kind, name="iPhone" if kind == "iphone" else "iPad", w=w, h=h,
+                orient="landscape" if w > h else "portrait", os=(st.get("os") or {}).get("version"))
+    return _DEV
 
 
 def guard(label: str, confirm: bool, *, enter: bool = False):
     """Refuse risky actions unless the USER approved (--confirm). Exit code 3 = needs approval."""
+    if confirm and os.environ.get("IPAD_USE_READONLY") and label and RISKY.search(label):
+        die(f"READ-ONLY session (IPAD_USE_READONLY is set): «{label}» is not allowed, even with --confirm. "
+            f"Report what you found and stop.", 3)
     if confirm:
         return
     if label and RISKY.search(label):
@@ -185,16 +219,17 @@ def elements() -> list[dict]:
     return uniq
 
 
-def screenshot(path: Path | None = None, width: int = 1100) -> Path:
+def screenshot(path: Path | None = None, width: int | None = 1100) -> Path:
     SHOTS.mkdir(parents=True, exist_ok=True)
     r = http("GET", "/screenshot", timeout=40)
     if not isinstance(r.get("value"), str):
         die(f"screenshot failed: {r}")
     png = SHOTS / "_raw.png"
     png.write_bytes(base64.b64decode(r["value"]))
-    path = path or SHOTS / time.strftime("ipad-%Y%m%d-%H%M%S.jpg")
+    path = path or SHOTS / time.strftime("shot-%Y%m%d-%H%M%S.jpg")
     if sys.platform == "darwin":
-        subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "70", "-Z", str(width), str(png), "--out", str(path)],
+        size = ["-Z", str(width)] if width else []          # None = native resolution
+        subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "70", *size, str(png), "--out", str(path)],
                        capture_output=True)
     if not path.exists():
         path = png
@@ -207,12 +242,13 @@ def see(shot=True, limit=80, find=None, as_json=False) -> str:
         els = [e for e in els if find.lower() in e["label"].lower()]
     els = els[:limit]
     HOME.mkdir(parents=True, exist_ok=True)
-    LAST.write_text(json.dumps({"t": time.time(), "elements": els}, ensure_ascii=False))
     app = active_app()
+    LAST.write_text(json.dumps({"t": time.time(), "app": app, "elements": els}, ensure_ascii=False))
     path = screenshot() if shot else None
     if as_json:
         return json.dumps({"app": app, "screenshot": str(path) if path else None, "elements": els}, ensure_ascii=False)
-    head = f"app: {app} · screen 1376×1032 pt (landscape) · {len(els)} elements" + (f" · screenshot: {path}" if path else "")
+    d = device()
+    head = f"{d['name']} · app: {app} · screen {d['w']}×{d['h']} pt ({d['orient']}) · {len(els)} elements" + (f" · screenshot: {path}" if path else "")
     rows = [f"[{i}] {e['type']} «{e['label']}» ({e['x']},{e['y']})" for i, e in enumerate(els)]
     return "\n".join([head, *rows]) + "\n(tap N uses these numbers; they expire after the screen changes — run `see` again)"
 
@@ -250,7 +286,7 @@ def type_text(text: str, enter=False, why="", confirm=False) -> str:
 
 
 def swipe(args: list[str]) -> str:
-    w, h = 1376, 1032
+    w, h = device()["w"], device()["h"]
     if len(args) == 1:
         d = args[0]
         p = {"up": (w / 2, h * .75, w / 2, h * .25), "down": (w / 2, h * .25, w / 2, h * .75),
@@ -310,6 +346,18 @@ def alert(action: str, btn: str | None = None, confirm=False) -> str:
     return f"alert {action}" if not err(r) else f"alert {action} failed: {err(r)}"
 
 
+def same_app(what: str):
+    """Blind sequences (play, draw) fire many touches without looking. Refuse if the foreground app is not the one the
+    last `see` saw — a notification tapped by accident, or the user picking the device up, must stop the sequence."""
+    try:
+        seen = json.loads(LAST.read_text()).get("app")
+    except FileNotFoundError:
+        seen = None
+    now = active_app()
+    if not seen or seen != now:
+        die(f"{what} stopped: foreground app is {now}, the last `see` saw {seen}. Run `see` on the target app first.")
+
+
 # =============================== batch ===============================
 def run_batch(script: str) -> str:
     """Several steps in one call: 'tap 3; type "hi"; wait 1; see'. Stops at the first error or approval need."""
@@ -325,11 +373,11 @@ def run_batch(script: str) -> str:
 
 
 # =============================== agent (optional) ===============================
-AGENT_SYSTEM = """You operate a real iPad (landscape, 1376×1032 points). Each turn you get the goal, a screenshot and a
-numbered element list. Reply JSON only: {"thought":"<≤20 words>","action":{...}} with ONE action:
-{"type":"tap","n":N} | {"type":"tap","x":X,"y":Y,"what":"label"} | {"type":"type","text":"…","enter":false} |
-{"type":"swipe","dir":"up|down|left|right"} | {"type":"open","app":"<name or bundle id>"} | {"type":"url","url":"https://…"} |
-{"type":"home"} | {"type":"wait","sec":1-8} | {"type":"done","success":true,"summary":"…"}.
+AGENT_SYSTEM = """You operate a real {name} ({orient}, {w}×{h} points). Each turn you get the goal, a screenshot and a
+numbered element list. Reply JSON only: {{"thought":"<≤20 words>","action":{{...}}}} with ONE action:
+{{"type":"tap","n":N}} | {{"type":"tap","x":X,"y":Y,"what":"label"}} | {{"type":"type","text":"…","enter":false}} |
+{{"type":"swipe","dir":"up|down|left|right"}} | {{"type":"open","app":"<name or bundle id>"}} | {{"type":"url","url":"https://…"}} |
+{{"type":"home"}} | {{"type":"wait","sec":1-8}} | {{"type":"done","success":true,"summary":"…"}}.
 Act without asking for confirmation on normal steps; choose sensible defaults. Prefer tap by n. Verify each step on the
 next screenshot. Never type passwords/codes/card numbers. If login or payment blocks you → done success:false."""
 
@@ -346,7 +394,7 @@ def agent(goal: str, steps: int = 25) -> str:
         LAST.write_text(json.dumps({"t": time.time(), "elements": els}, ensure_ascii=False))
         jpg = screenshot(width=1000).read_bytes()
         lst = "\n".join(f"[{k}] {e['type']} «{e['label']}» ({e['x']},{e['y']})" for k, e in enumerate(els))
-        body = {"systemInstruction": {"parts": [{"text": AGENT_SYSTEM}]},
+        body = {"systemInstruction": {"parts": [{"text": AGENT_SYSTEM.format(**device())}]},
                 "contents": [{"role": "user", "parts": [
                     {"text": f"GOAL: {goal}\nAPP: {active_app()}\nDONE SO FAR:\n" + ("\n".join(hist[-8:]) or "-") + f"\nELEMENTS:\n{lst}"},
                     {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(jpg).decode()}}]}],
@@ -615,6 +663,14 @@ def _rdp(pts, eps):
     return [pts[0], pts[-1]]
 
 
+def default_canvas() -> tuple:
+    """The iPad landscape canvas as measured; on other screens a centred box clear of the top bar and bottom tools."""
+    d = device()
+    if d["kind"] == "ipad" and d["orient"] == "landscape":
+        return CANVAS
+    return (round(d["w"] * .08), round(d["h"] * .2), round(d["w"] * .84), round(d["h"] * .5))
+
+
 def plan_strokes(strokes: list, box=CANVAS, detail=1.5) -> list:
     xs = [x for st in strokes for x, _ in st]; ys = [y for st in strokes for _, y in st]
     if not xs:
@@ -684,7 +740,7 @@ def draw(source: str, kind: str, box=None, detail=1.5, tool=None, color=None, dr
     if exact:                                                # coordinates are already screen points (layered, multi-colour drawings)
         xs = [x for st in raw for x, _ in st]; ys = [y for st in raw for _, y in st]
         box = (min(xs), min(ys), (max(xs) - min(xs)) or 1, (max(ys) - min(ys)) or 1) if xs else box
-    plan = plan_strokes(raw, box or CANVAS, detail)
+    plan = plan_strokes(raw, box or default_canvas(), detail)
     npts = sum(len(p) for p in plan)
     HOME.mkdir(parents=True, exist_ok=True)
     prev = SHOTS / "draw-preview.svg"; SHOTS.mkdir(parents=True, exist_ok=True)
@@ -704,6 +760,125 @@ def draw(source: str, kind: str, box=None, detail=1.5, tool=None, color=None, dr
         "\nTip: in Freeform/Notes select a tool first (`see --find Monoline`), or pass --tool Monoline --color Black."
 
 
+# =============================== playing ===============================
+# Real-time taps: a whole phrase goes to the device as ONE W3C touch sequence, so the timing between notes is kept by
+# the device itself (not by network round-trips). Works on any on-screen instrument: piano keys, drum pads, a game.
+GAP_PLAN, GAP_REAL = 25, 6      # ms: gap written between touches → what it collapses to on the device (measured)
+_FLAT = {"DB": "C#", "EB": "D#", "GB": "F#", "AB": "G#", "BB": "A#"}
+_NOTE = re.compile(r"^([A-Ga-g])([#♯b♭]?)(-?\d)$")
+
+
+def _canon(name: str) -> str | None:
+    m = _NOTE.match(name.strip().replace(" ", ""))
+    if not m:
+        return None
+    letter, acc, octv = m.group(1).upper(), m.group(2).replace("♯", "#").replace("♭", "b"), m.group(3)
+    if acc == "b":
+        return _FLAT.get(letter + "B", letter) + octv
+    return letter + acc + octv
+
+
+def piano_map(spec: str) -> dict:
+    """'C4@283,C5@689,374,217' → every key between and around them. Two labelled keys an octave (or more) apart give the
+    key width; then y of the white keys (below the black ones) and y of the black keys. Read all four off a screenshot."""
+    try:
+        a, b, wy, by = spec.split(",")
+        (n1, x1), (n2, x2) = a.split("@"), b.split("@")
+        idx = lambda n: "CDEFGAB".index(n[0].upper()) + 7 * int(n[1:])
+        i1, i2, x1, x2, wy, by = idx(n1), idx(n2), float(x1), float(x2), float(wy), float(by)
+        w = (x2 - x1) / (i2 - i1)
+    except Exception:
+        die("--piano wants 'C4@x,C5@x,whiteY,blackY' (points)")
+    out = {}
+    for i in range(i1 - 14, i2 + 15):
+        name, octv, x = "CDEFGAB"[i % 7], i // 7, x1 + (i - i1) * w
+        out[f"{name}{octv}"] = (round(x, 1), wy)
+        if name in "CDFGA":
+            out[f"{name}#{octv}"] = (round(x + w / 2, 1), by)
+    return out
+
+
+def key_map(keys: str | None) -> dict:
+    """note → (x, y). From a JSON file ({"C4": [x, y], …}) or from the last `see` (elements labelled like notes)."""
+    if keys and "@" in keys:
+        return piano_map(keys)
+    if keys:
+        return {(_canon(k) or k): tuple(v) for k, v in json.loads(Path(keys).read_text()).items()}
+    try:
+        els = json.loads(LAST.read_text())["elements"]
+    except FileNotFoundError:
+        die("no key map — run `ipad see` on the instrument first, or pass --keys keys.json")
+    out = {}
+    for e in els:
+        c = _canon(e["label"].split(",")[0])
+        if c and c not in out:
+            out[c] = (e["x"], e["y"])
+    return out
+
+
+def play(score: str, unit_ms: int = 200, hold: float = 1.0, keys: str | None = None, dry=False, rest_at=None) -> str:
+    """score: 'E5 D#5 E5/2 -/1 C4+E4/2 220,400' — note[/units]; '-' is a rest; '+' joins notes into a chord (≤5 touches);
+    a raw 'x,y' (points) taps that spot, so the same command drives drum pads or a rhythm game.
+
+    Measured on WebDriverAgent/XCTest (iPhone, iOS 26.5): the device keeps time only while something is touching the
+    screen — an idle gap between two touches collapses to a few ms, and with NO gap the two touches merge into one
+    finger dragging from key to key. So every touch is followed by a short planned gap (which collapses), and its
+    hold is the full note length minus that collapsed gap. A rest, or the silent part of a staccato note, is a
+    finger waiting on a dead spot (--rest-at x,y); without one a rest lengthens the previous note."""
+    km = None
+    segs, missing = [], set()                 # segs: [duration_ms, [(x, y), …]]  — contiguous, in order
+    for tok in score.split():
+        name, _, n = tok.partition("/")
+        dur = max(30.0, float(n or 1) * unit_ms)
+        if name in ("-", "R", "r"):
+            if rest_at:
+                segs.append([dur, [rest_at]])
+            elif segs:
+                segs[-1][0] += dur
+            continue
+        pts = []
+        for part in name.split("+")[:5]:
+            if re.match(r"^\d+(\.\d+)?,\d+(\.\d+)?$", part):
+                pts.append(tuple(float(v) for v in part.split(",")))
+                continue
+            km = key_map(keys) if km is None else km
+            c = _canon(part)
+            if c in km:
+                pts.append(tuple(km[c]))
+            else:
+                missing.add(part)
+        if rest_at and hold < 1:
+            segs += [[dur * hold, pts], [dur * (1 - hold), [rest_at]]]
+        else:
+            segs.append([dur, pts])
+    if missing:
+        die(f"no key on screen for: {', '.join(sorted(missing))} · known: {' '.join(sorted(km or {})) or '(none)'} — "
+            f"shift the octave / resize the keyboard and `see` again, or pass --keys")
+    if not segs:
+        die("nothing to play")
+    total = sum(d for d, _ in segs)
+    n = sum(len(p) for d, p in segs if p != [rest_at])
+    head = f"play: {n} taps · {total / 1000:.1f}s at {unit_ms} ms/unit" + ("" if rest_at else " · legato (no --rest-at)")
+    if dry:
+        return head + " (dry run)"
+    same_app("play")
+    # One pointer source per touch: [wait, move, down, hold, up] — each becomes its own touch path with its own clock.
+    # (A move after a lift on the SAME source drags the lifted touch and adds a ghost touch on the next key.)
+    sources, clock = [], 0.0
+    for dur, pts in segs:
+        down = max(20, round(dur - GAP_REAL))
+        for x, y in pts:
+            sources.append({"type": "pointer", "id": f"t{len(sources)}", "parameters": {"pointerType": "touch"}, "actions": [
+                {"type": "pause", "duration": round(clock)}, {"type": "pointerMove", "duration": 0, "x": round(x, 1), "y": round(y, 1)},
+                {"type": "pointerDown", "button": 0}, {"type": "pause", "duration": down}, {"type": "pointerUp", "button": 0}]})
+        clock += down + GAP_PLAN
+    start = time.time()
+    r = s("POST", "/actions", {"actions": sources}, timeout=total / 1000 * 3 + 120)
+    took = time.time() - start
+    audit("play", taps=n, planned=round(total / 1000, 1), took=round(took, 1))
+    return f"{head}\nplayed in {took:.1f}s (the extra is set-up before the first touch)" if not err(r) else f"play failed: {err(r)}"
+
+
 # =============================== doctor / status ===============================
 def doctor() -> str:
     lines = []
@@ -714,13 +889,13 @@ def doctor() -> str:
     lines.append(f"{ok(bool(c.get('udid')))} config: {CONFIG if c else 'missing → run scripts/setup.sh'}")
     try:
         st = http("GET", "/status", timeout=6).get("value") or {}
-        lines.append(f"{ok(st.get('ready'))} WebDriverAgent at {wda_url()} · iPadOS {(st.get('os') or {}).get('version')}")
+        lines.append(f"{ok(st.get('ready'))} WebDriverAgent at {wda_url()} · {(st.get('device') or 'ipad').lower().replace('ipad', 'iPad').replace('iphone', 'iPhone')} · iOS/iPadOS {(st.get('os') or {}).get('version')}")
         lk = http("GET", "/wda/locked", timeout=6).get("value")
-        lines.append(f"{ok(lk is False)} screen unlocked" + ("" if lk is False else " → unlock the iPad (Auto-Lock: Never while charging helps)"))
+        lines.append(f"{ok(lk is False)} screen unlocked" + ("" if lk is False else " → unlock the device (Auto-Lock: Never while charging helps)"))
     except Stop as e:
         lines.append(f"❌ {e}")
     except Exception as e:
-        lines.append(f"❌ WebDriverAgent not reachable ({type(e).__name__}) → iPad asleep/locked, or the runner stopped: "
+        lines.append(f"❌ WebDriverAgent not reachable ({type(e).__name__}) → device asleep/locked, or the runner stopped: "
                      f"launchctl kickstart -k gui/$(id -u)/com.ipad-use.wda")
     return "\n".join(lines)
 
@@ -728,7 +903,9 @@ def doctor() -> str:
 def status() -> str:
     st = http("GET", "/status", timeout=8).get("value") or {}
     b = s("GET", "/wda/batteryInfo", timeout=8).get("value") or {}
-    return json.dumps({"ready": st.get("ready"), "ios": (st.get("os") or {}).get("version"), "app": active_app(),
+    d = device()
+    return json.dumps({"ready": st.get("ready"), "device": d["kind"], "screen": f"{d['w']}x{d['h']} {d['orient']}",
+                       "ios": (st.get("os") or {}).get("version"), "app": active_app(),
                        "locked": http("GET", "/wda/locked", timeout=8).get("value"),
                        "battery": round(float(b.get("level", 0)) * 100)}, ensure_ascii=False)
 
@@ -769,6 +946,13 @@ def dispatch(argv: list[str]) -> str:
     x.add_argument("--tool", help="e.g. Monoline, Pen, Marker"); x.add_argument("--color", help="e.g. Black, Blue, Red")
     x.add_argument("--dry-run", action="store_true")
     x.add_argument("--exact", action="store_true", help="SVG coordinates are already screen points — do not fit to a box")
+    x = sp.add_parser("play"); x.add_argument("score", help="'E5 D#5 E5/2 -/1 C4+E4/2' or @file")
+    x.add_argument("--unit-ms", type=int, default=200, help="length of one unit in ms (a 16th at 75 bpm = 200)")
+    x.add_argument("--hold", type=float, default=1.0, help="part of each note the finger stays down (needs --rest-at when < 1)")
+    x.add_argument("--keys", help="JSON note→[x,y] map (default: note-labelled elements from the last `see`)")
+    x.add_argument("--piano", help="'C4@x,C5@x,whiteY,blackY' — build the key map from two labelled keys on a screenshot")
+    x.add_argument("--rest-at", help="x,y of a dead spot where a finger waits during rests (keeps rests in time)")
+    x.add_argument("--dry-run", action="store_true")
     for c in ("status", "doctor", "apps"):
         sp.add_parser(c)
     a = p.parse_args(argv)
@@ -803,7 +987,7 @@ def dispatch(argv: list[str]) -> str:
         time.sleep(min(30, a.sec))
         return f"waited {a.sec}s"
     if c == "shot":
-        return str(screenshot(Path(a.out) if a.out else None, 2752 if a.full else 1100))
+        return str(screenshot(Path(a.out) if a.out else None, None if a.full else 1100))
     if c == "run":
         return run_batch(a.script)
     if c == "do":
@@ -814,6 +998,10 @@ def dispatch(argv: list[str]) -> str:
             die("ipad draw <file.svg> | --shape star | --text 'HELLO'")
         box = tuple(float(v) for v in a.box.split(",")) if a.box else None
         return draw(src, kind, box, a.detail, a.tool, a.color, a.dry_run, a.exact)
+    if c == "play":
+        sc = Path(a.score[1:]).read_text() if a.score.startswith("@") else a.score
+        rest = tuple(float(v) for v in a.rest_at.split(",")) if a.rest_at else None
+        return play(sc, a.unit_ms, a.hold, a.piano or a.keys, a.dry_run, rest)
     if c == "status":
         return status()
     if c == "doctor":
@@ -830,7 +1018,7 @@ def main():
         print(str(e), file=sys.stderr if e.code != 3 else sys.stdout)
         sys.exit(e.code)
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-        print(f"WDA unreachable or busy ({e}). Is the iPad unlocked and on the same network? Try: ipad doctor", file=sys.stderr)
+        print(f"WDA unreachable or busy ({e}). Is the device unlocked and on the same network? Try: ipad doctor", file=sys.stderr)
         sys.exit(4)
 
 
