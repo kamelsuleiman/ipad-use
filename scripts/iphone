@@ -1,0 +1,4 @@
+#!/bin/sh
+# iphone — the same CLI as `ipad`, pointed at your iPhone. It keeps the iPhone's own config, session, screenshots and
+# audit log in ~/.ipad-use-iphone, so an iPad and an iPhone can be set up side by side.
+IPAD_USE_HOME="${IPHONE_USE_HOME:-$HOME/.ipad-use-iphone}" exec "$(dirname "$0")/ipad" "$@"

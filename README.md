@@ -1,7 +1,27 @@
-# iPad Use 🖐️📱
+# iPad Use 🖐️📱 — now with iPhone
 
 **An Agent Skill that lets Claude Code, Codex, Cursor, Hermes — any agent that reads `SKILL.md` — see and control a
-real iPad over Wi-Fi.** Open apps, tap, type (Arabic too), run Shortcuts, generate in Gemini/ChatGPT, read the screen.
+real iPad or iPhone over Wi-Fi.** Open apps, tap, type (Arabic too), run Shortcuts, generate in Gemini/ChatGPT, read the screen.
+
+## New: iPhone 📱
+Same commands, same safety gate — use `scripts/iphone` instead of `scripts/ipad`.
+
+```text
+you › "Use the iPhone use skill. Free some space on my iPhone. Start with WhatsApp."
+agent › iphone open net.whatsapp.WhatsApp → You → Storage and data → Free up storage
+agent › "WhatsApp uses 54.2 GB. Biggest chats: … Which ones may I clean?"        you › "the news group"
+agent › Select → Select all (1,067)  →  NEEDS_APPROVAL «Delete»  →  "Delete 1,067 items, 2.52 GB?"   you › yes
+agent › "Delete items, or items and any copies?"                                 you › "items"
+agent › Used: 54.2 GB → 51.7 GB  ✅   (nobody touched the phone)
+```
+
+```bash
+scripts/setup.sh --team <YOUR_APPLE_TEAM_ID> --iphone     # one time, iPhone connected by cable, Developer Mode on
+scripts/iphone doctor
+```
+On a phone, WebDriverAgent starts on demand (unlock the iPhone first). Field notes: [`references/iphone.md`](references/iphone.md) ·
+WhatsApp storage playbook: [`references/apps/whatsapp.md`](references/apps/whatsapp.md).
+**Windows:** not yet — it needs Xcode on a Mac. If you can make it run from Windows, PRs are very welcome.
 
 > Computer Use exists for the Mac. Browser Use exists for the web. Mobile MCPs exist for iPhone *testing*.
 > **iPad Use** is for *using* your iPad: iPadOS 26-aware, safety-gated, and fast enough to feel like an assistant.
@@ -33,7 +53,7 @@ Strokes come out crisp because every stroke dwells briefly after touch-down, at 
 - **iPad-aware.** Field notes for iPadOS 26: multiple windows, hidden system sheets, permission prompts in portrait
   coordinates, the Files rename trap, default-browser surprises — see [`references/ipados-26.md`](references/ipados-26.md).
 - **Safety gate built in.** Send / post / pay / delete / sign-out are held until the user says yes (`--confirm`).
-- **App playbooks.** Real labels + fastest paths: Safari, Notes, Gemini, Files, Settings, Freeform — more welcome by PR.
+- **App playbooks.** Real labels + fastest paths: Safari, Notes, Gemini, Files, Settings, Freeform, WhatsApp — more welcome by PR.
 - **Zero dependencies.** One Python 3.9 stdlib script + Apple's own XCUITest via WebDriverAgent.
 
 ## Install
